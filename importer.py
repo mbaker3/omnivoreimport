@@ -476,7 +476,6 @@ def clean_html(html_content):
     """
     Clean and standardize HTML content
     - Wraps content in html/body tags
-    - Removes comments
     - Strips data- attributes
     - Normalizes whitespace
     - Replace proxy with original URL
@@ -488,9 +487,6 @@ def clean_html(html_content):
     html_content = re.sub(proxy_regex, '', html_content)
 
     soup = BeautifulSoup(html_content, 'html.parser')
-    # Remove comments
-    for comment in soup.find_all(string=lambda text: isinstance(text, str) and text.strip().startswith('<!--')):
-        comment.extract()
 
     # Remove data attributes
     for tag in soup.find_all(lambda t: any(i.startswith('data-') for i in t.attrs)):

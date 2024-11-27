@@ -479,8 +479,13 @@ def clean_html(html_content):
     - Removes comments
     - Strips data- attributes
     - Normalizes whitespace
+    - Replace proxy with original URL
     """
     html_content = "<html><body>" + html_content + "</body></html>"
+
+    proxy_regex = r'https://proxy-prod\.omnivore-image-cache\.app/\d+x\d+,[A-Za-z0-9_-]+/'
+
+    html_content = re.sub(proxy_regex, '', html_content)
 
     soup = BeautifulSoup(html_content, 'html.parser')
     # Remove comments

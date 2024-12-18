@@ -792,7 +792,7 @@ def parse_args():
     parser.add_argument('--folder', required=True,
                       help='Path to folder containing contents of extracted archive')
     parser.add_argument('--ignore-invalid-certs', action="store_true",
-                      help='Bypass validating TSL certificates during API calls')
+                      help='Bypass validating TLS/SSL certificates during API calls')
     return parser.parse_args()
 
 if __name__ == "__main__":

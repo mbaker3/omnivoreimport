@@ -396,7 +396,7 @@ def html_to_text_map(html_content: str) -> Tuple[str, list]:
     process_node(soup)
     return ''.join(plain_text), position_map
 
-def find_best_match(text: str, pattern: str, cutoff: float = 0.6) -> Tuple[Optional[int], Optional[int], float]:
+def find_best_match(text: str, pattern: str, cutoff: float = 0.9) -> Tuple[Optional[int], Optional[int], float]:
     """
     Find the best fuzzy match with more precise boundary detection.
     """
@@ -446,7 +446,7 @@ def find_best_match(text: str, pattern: str, cutoff: float = 0.6) -> Tuple[Optio
     
     return best_start_index, best_end_index, best_ratio
 
-def find_markdown_in_html(html_text: str, position_map: list, markdown_content: str) -> Tuple[Optional[int], Optional[int], float]:
+def find_markdown_in_html(html_content: str, markdown_content: str) -> Tuple[Optional[str], Optional[int], Optional[int], float]:
     """
     Find the portion of HTML that corresponds to the given Markdown content.
     """
@@ -454,12 +454,15 @@ def find_markdown_in_html(html_text: str, position_map: list, markdown_content: 
     md_html = markdown.markdown(markdown_content)
     md_soup = BeautifulSoup(md_html, 'html.parser')
     md_text = md_soup.get_text()
+
+    # Convert HTML to text while maintaining position mapping
+    html_text, position_map = html_to_text_map(html_content)
     
     # Find best matching span in the text
     start_idx, end_idx, similarity = find_best_match(html_text, md_text)
     
     if start_idx is None:
-        return None, None, 0
+        return None,None, None, 0
     
     # Adjust indices to ensure they're within bounds
     start_idx = max(0, min(start_idx, len(position_map) - 1))
@@ -468,8 +471,10 @@ def find_markdown_in_html(html_text: str, position_map: list, markdown_content: 
     # Convert text positions back to HTML positions
     html_start = position_map[start_idx]
     html_end = position_map[end_idx]
-    
-    return html_start, html_end, similarity
+
+    # Extract the HTML span
+    matching_html = html_content[html_start:html_end]
+    return matching_html, html_start, html_end, similarity
 
 
 def clean_html(html_content):
@@ -506,7 +511,7 @@ def find_closest_match(target: str, candidates: list[str]) -> str:
         raise ValueError("Candidates list cannot be empty")
         
     def similarity(a: str, b: str) -> float:
-        return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+        return fuzz.ratio(None, a.lower(), b.lower()).ratio()
     
     closest = max(candidates, key=lambda x: similarity(target, x))
     
@@ -518,7 +523,7 @@ def add_highlight_tag(content: str, highlight: Dict) -> str:
     Inserts span tags at the start and end of highlighted text
     Returns modified HTML string
     """
-    logger.debug(f"adding highlight tag")
+    logger.info(f"adding highlight tag")
     output = (content[:highlight["start_index"]] +
              '<span data-omnivore-highlight-start="true"></span>' +
              content[highlight["start_index"]:highlight["end_index"]] +
@@ -610,7 +615,7 @@ def save_page(api, metadata: Dict, content: Optional[str] = None,
             title=metadata["title"],
             labels=labels
         )
-        logger.debug(f"calling gql save_page_mutation={save_page_mutation}")
+        logger.info(f"calling gql save_page_mutation={save_page_mutation}")
         result = api.gql_request(save_page_mutation)
     else:
         logger.debug(f"generating save_url_mutation")
@@ -625,7 +630,7 @@ def save_page(api, metadata: Dict, content: Optional[str] = None,
     if not page_id:
         raise Exception(f"Failed to save article: {metadata['title']}")
         
-    logger.info(f"Successfully imported with ID: {page_id}")
+    logger.info(f'Successfully imported "{metadata["title"]}" with ID: {page_id}')
     return page_id
 
 def process_highlights_in_content(content: str, highlights_data: Dict) -> str:
@@ -633,18 +638,20 @@ def process_highlights_in_content(content: str, highlights_data: Dict) -> str:
     Process and add highlight tags to the content
     Returns modified content with highlight tags
     """
-    # Convert HTML to text while maintaining position mapping
-    html_text, position_map = html_to_text_map(content)
-    for highlight in tqdm(highlights_data["highlights"], desc="highlights in article", disable=True):
-        logger.debug(f"processing highlight={highlight}")
 
-        highlight["start_index"], highlight["end_index"], highlight["ratio"] = find_markdown_in_html(html_text, position_map, highlight["quote"])
-        if highlight["start_index"]:
-            logger.debug(f"highlight start_index found")
-            highlight["html"] = html_text[highlight["start_index"]:highlight["end_index"]]
+    num_highlights = len(highlights_data['highlights'])
+    logger.info(f"processing highlights={num_highlights}")
+    for index, highlight in enumerate(tqdm(highlights_data["highlights"], desc="highlights in article", disable=False)):
+        html_content, start_index, end_index, ratio = find_markdown_in_html(content, highlight["quote"])
+        if start_index:
+            logger.info(f'adding highlight #{index}/{num_highlights}: start_index={start_index}, highlight end_index={end_index}, similarity={ratio}')
+            highlight["html"] = html_content
+            highlight["start_index"] = start_index
+            highlight["end_index"] = end_index
+            highlight["ratio"] = ratio
             content = add_highlight_tag(content, highlight)
         else:
-            logger.error(f"Failed to import highlight: {highlight['quote'][:50]}...")
+            logger.error(f"Failed to import highlight #{index}/{num_highlights}: {highlight['quote'][:50]}...")
     return content
 
 def update_page_metadata(api, page_id: str, metadata: Dict):
@@ -687,9 +694,11 @@ def process_highlights(api, page_id: str, highlights_data: Dict):
                       if x['node']['id'] == page_id]
     
     if not page_highlights:
+        logger.info(f"no highlights processed for pageId={page_id}")
         return
         
     for highlight in highlights_data["highlights"]:
+        logger.info(f"processing highlight={highlight}")
         highlight_quotes = [x["quote"] for x in page_highlights[0] if x["quote"]]
         closest_match = find_closest_match(highlight["quote"], highlight_quotes)
         highlight_result = [x for x in page_highlights[0] if x["quote"] == closest_match]

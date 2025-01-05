@@ -4,15 +4,20 @@ import json
 import os
 import re
 import uuid
+import logging
+import markdown
+import requests
 from html import escape
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-import markdown
-import requests
 from bs4 import BeautifulSoup, NavigableString
 from nanoid import generate
+from tqdm import tqdm
+from rapidfuzz import fuzz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+logging.basicConfig(level=logging.INFO, filename="log.log")
+logger = logging.getLogger()
 
 # Main API client class for interacting with Omnivore's GraphQL API
 class OmnivoreAPI:
@@ -412,14 +417,13 @@ def find_best_match(text: str, pattern: str, cutoff: float = 0.6) -> Tuple[Optio
     first_pattern_word = pattern_words[0] if pattern_words else ""
     
     # Sliding window over tokenized words with variable window size
-    for window in range(window_size - 1, window_size + 2):  # Try different window sizes
+    for window in tqdm(range(window_size - 1, window_size + 2), desc="Fuzzy matching windows", unit="windows", disable=True):  # Try different window sizes
         for i in range(len(text_words) - window + 1):
             candidate_words = text_words[i:i + window]
             candidate = ' '.join(candidate_words)
             
             # Compute similarity ratio
-            ratio = difflib.SequenceMatcher(None, candidate, pattern).ratio()
-            
+            ratio = fuzz.ratio(candidate, pattern)
             if ratio > best_ratio and ratio >= cutoff:
                 # Calculate character-level indices in original text
                 prefix = ' '.join(text_words[:i])
@@ -443,7 +447,7 @@ def find_best_match(text: str, pattern: str, cutoff: float = 0.6) -> Tuple[Optio
     
     return best_start_index, best_end_index, best_ratio
 
-def find_markdown_in_html(html_content: str, markdown_content: str) -> Tuple[Optional[str], Optional[int], Optional[int], float]:
+def find_markdown_in_html(html_text: str, position_map: list, markdown_content: str) -> Tuple[Optional[int], Optional[int], float]:
     """
     Find the portion of HTML that corresponds to the given Markdown content.
     """
@@ -452,14 +456,11 @@ def find_markdown_in_html(html_content: str, markdown_content: str) -> Tuple[Opt
     md_soup = BeautifulSoup(md_html, 'html.parser')
     md_text = md_soup.get_text()
     
-    # Convert HTML to text while maintaining position mapping
-    html_text, position_map = html_to_text_map(html_content)
-    
     # Find best matching span in the text
     start_idx, end_idx, similarity = find_best_match(html_text, md_text)
     
     if start_idx is None:
-        return None, None, None, 0
+        return None, None, 0
     
     # Adjust indices to ensure they're within bounds
     start_idx = max(0, min(start_idx, len(position_map) - 1))
@@ -469,10 +470,8 @@ def find_markdown_in_html(html_content: str, markdown_content: str) -> Tuple[Opt
     html_start = position_map[start_idx]
     html_end = position_map[end_idx]
     
-    # Extract the HTML span
-    matching_html = html_content[html_start:html_end]
-    
-    return matching_html, html_start, html_end, similarity
+    return html_start, html_end, similarity
+
 
 def clean_html(html_content):
     """
@@ -520,6 +519,7 @@ def add_highlight_tag(content: str, highlight: Dict) -> str:
     Inserts span tags at the start and end of highlighted text
     Returns modified HTML string
     """
+    logger.debug(f"adding highlight tag")
     output = (content[:highlight["start_index"]] +
              '<span data-omnivore-highlight-start="true"></span>' +
              content[highlight["start_index"]:highlight["end_index"]] +
@@ -552,7 +552,7 @@ def parse_highlights_file(file_path: str) -> Dict:
     
     current_highlight = None
     
-    for block in blocks:
+    for block in tqdm(blocks, unit="blocks", disable=True):
         lines = block.strip().split('\n')
         
         # Parse quotes, labels, and notes according to their markers
@@ -599,30 +599,34 @@ def save_page(api, metadata: Dict, content: Optional[str] = None,
     Returns the page ID if successful
     """
     labels = [{"name": label} for label in metadata.get("labels", [])]
-    
+    logger.debug(f"generated labels={labels}")
     if content:
         if highlights_data:
+            logger.debug(f"getting highlights_in_content")
             content = process_highlights_in_content(content, highlights_data)
-                
+        logger.debug(f"generating save_page_mutation")
         save_page_mutation = api.save_page_mutation(
             url=metadata["url"],
             content=content,
             title=metadata["title"],
             labels=labels
         )
+        logger.debug(f"calling gql save_page_mutation={save_page_mutation}")
         result = api.gql_request(save_page_mutation)
     else:
+        logger.debug(f"generating save_url_mutation")
         save_url_mutation = api.save_url_mutation(
             url=metadata["url"],
             labels=labels
         )
+        logger.debug(f"Calling gql with save_url_mutation={save_url_mutation}")
         result = api.gql_request(save_url_mutation)
-    
+    # NB this won't work for PDFs -> calls savePage instead
     page_id = result["savePage"].get("clientRequestId")
     if not page_id:
         raise Exception(f"Failed to save article: {metadata['title']}")
         
-    print(f"Successfully imported with ID: {page_id}")
+    logger.info(f"Successfully imported with ID: {page_id}")
     return page_id
 
 def process_highlights_in_content(content: str, highlights_data: Dict) -> str:
@@ -630,13 +634,18 @@ def process_highlights_in_content(content: str, highlights_data: Dict) -> str:
     Process and add highlight tags to the content
     Returns modified content with highlight tags
     """
-    for highlight in highlights_data["highlights"]:
-        highlight["html"], highlight["start_index"], highlight["end_index"], highlight["ratio"] = \
-            find_markdown_in_html(content, highlight["quote"])
+    # Convert HTML to text while maintaining position mapping
+    html_text, position_map = html_to_text_map(content)
+    for highlight in tqdm(highlights_data["highlights"], desc="highlights in article", disable=True):
+        logger.debug(f"processing highlight={highlight}")
+
+        highlight["start_index"], highlight["end_index"], highlight["ratio"] = find_markdown_in_html(html_text, position_map, highlight["quote"])
         if highlight["start_index"]:
+            logger.debug(f"highlight start_index found")
+            highlight["html"] = html_text[highlight["start_index"]:highlight["end_index"]]
             content = add_highlight_tag(content, highlight)
         else:
-            print(f"Failed to import highlight: {highlight['quote'][:50]}...")
+            logger.error(f"Failed to import highlight: {highlight['quote'][:50]}...")
     return content
 
 def update_page_metadata(api, page_id: str, metadata: Dict):
@@ -710,20 +719,50 @@ def import_article(api, metadata: Dict, content: Optional[str] = None,
     Main orchestration function that calls other specialized functions
     """
     # Save the page and get its ID
+    logger.debug(f"about to save page")
     page_id = save_page(api, metadata, content, highlights_data)
-    
+    logger.info(f"Saved page: {page_id}. Now updating metadata")
     # Update page metadata and reading progress
     update_page_metadata(api, page_id, metadata)
-    
+    logger.info(f"updated metadata, now moving to highlights data")
     # Process highlights if they exist
     if highlights_data:
         # Add article-level note
+        logger.info(f"processing article-level note")
         process_article_note(api, page_id, highlights_data["article_note"])
         
         # Process highlights, their notes and labels
+        logger.info(f"processing article highlights, notes, and labels")
         process_highlights(api, page_id, highlights_data)
     
     return page_id
+
+def process_article(article, content_dir, highlights_dir, api):
+    url = article['url']
+    slug = article['slug']
+    
+    logger.info(f"Importing: {article['title']}")
+    
+    # Get content if available
+    content_file = os.path.join(content_dir, f"{slug}.html")
+    content = None
+    if os.path.exists(content_file):
+        with open(content_file, 'r', encoding='utf-8') as f:
+            content = clean_html(f.read())
+    
+    # Get highlights if available
+    highlights_file = os.path.join(highlights_dir, f"{slug}.md")
+    highlights_data = parse_highlights_file(highlights_file)
+    
+    try:
+        page_id = import_article(
+            api=api,
+            metadata=article,
+            content=content,
+            highlights_data=highlights_data
+        )
+    except Exception as e:
+        logger.error(f"Failed to import {article['title']}", exc_info=True)
 
 def import_folder(api, folder_path: str):
     """Import an entire folder of content into Omnivore"""
@@ -747,41 +786,25 @@ def import_folder(api, folder_path: str):
                 else:
                     metadata.append(data)
                     
-            print(f"Successfully processed: {json_file.name}")
+            logger.info(f"Successfully processed: {json_file.name}")
         except json.JSONDecodeError as e:
-            print(f"Error reading {json_file.name}: Invalid JSON format - {str(e)}")
+            logger.error(f"Error reading {json_file.name}: Invalid JSON format", exc_info=True)
         except Exception as e:
-            print(f"Error processing {json_file.name}: {str(e)}")
+            logger.error(f"Error processing {json_file.name}", exc_info=True)
             
     content_dir = os.path.join(folder_path, "content")
     highlights_dir = os.path.join(folder_path, "highlights")
-    
-    for article in metadata:
-        url = article['url']
-        slug = article['slug']
-        
-        print(f"\nImporting: {article['title']}")
-        
-        # Get content if available
-        content_file = os.path.join(content_dir, f"{slug}.html")
-        content = None
-        if os.path.exists(content_file):
-            with open(content_file, 'r', encoding='utf-8') as f:
-                content = clean_html(f.read())
-        
-        # Get highlights if available
-        highlights_file = os.path.join(highlights_dir, f"{slug}.md")
-        highlights_data = parse_highlights_file(highlights_file)
-        
-        try:
-            page_id = import_article(
-                api=api,
-                metadata=article,
-                content=content,
-                highlights_data=highlights_data
-            )
-        except Exception as e:
-            print(f"Failed to import {article['title']}: {str(e)}")
+    num_threads = 8
+    with tqdm(total=len(metadata), desc="Processing Articles") as pbar:
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(process_article, article, content_dir, highlights_dir, api) for article in metadata]
+            for future in as_completed(futures):
+                try:
+                    future.result()  # Get the result (if any)
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Error processing article", exc_info=True) 
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Import articles and highlights into Omnivore')
@@ -797,10 +820,9 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    
     try:
         importer = OmnivoreAPI(args.api_url, args.api_key, not args.ignore_invalid_certs)
         import_folder(importer, args.folder)
     except Exception as e:
-        print(f"Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         exit(1)

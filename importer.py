@@ -1,5 +1,4 @@
 import argparse
-import difflib
 import json
 import os
 import re

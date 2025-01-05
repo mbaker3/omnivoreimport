@@ -2,3 +2,5 @@ beautifulsoup4==4.12.3
 Markdown==3.7
 nanoid==2.0.0
 Requests==2.32.3
+tqdm==4.67.1
+rapidfuzz==3.11.0
